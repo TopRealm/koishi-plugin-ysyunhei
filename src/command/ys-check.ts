@@ -1,9 +1,28 @@
 import sanitizeErrorMessage from '../utils/sanitize-error-message';
 import processInBatches from '../utils/processIn-batches';
+import {
+  getCapabilities,
+  describeUnsupported,
+  isSelfManager,
+  isCallerManager,
+  isManager,
+  listAllMembers,
+  kickMember,
+  getStrangerNickname,
+} from '../utils/platform';
 
 import type { Context, Session } from 'koishi';
-import type { OneBot } from 'koishi-plugin-adapter-onebot';
 import type Config from '../config';
+
+/**
+ * 供整群检查时使用的最小成员结构
+ */
+interface CheckMember {
+  user_id: string
+  nickname: string
+  /** 是否为群主/管理员等机器人通常无权操作的角色 */
+  isPrivileged: boolean
+}
 
 /**
  * 查询黑名单用户
@@ -18,29 +37,40 @@ export default async function check(ctx: Context, meta: Session, qqnum: string, 
   if (meta.guildId === undefined) {
     return '错误：请在群组内使用命令。'
   }
-  const isAdmin = !!(config.admin_qqs && (meta.userId in config.admin_qqs))
-  //查询所有用户信息（仅管理员可用，且需要机器人权限）
+  //检查机器人权限
+  try {
+    const check = await isSelfManager(meta)
+    if (!check.ok) {
+      return '错误：本功能需要机器人为群组管理员，请联系群主设置。'
+    }
+  } catch (error) {
+  return `错误：检查机器人权限失败，可能是机器人未加入该群或API出现问题。原因：${sanitizeErrorMessage(error, config)}`
+  }
+
+  //检查使用者是否为管理
+  // OneBot: 走 admin_qqs 白名单；QQ 官方群: 检测消息发送者的 member_role（admin/owner）
+  const callerCheck = isCallerManager(meta, config)
+  if (!callerCheck.ok) {
+    return '错误：您没有使用该命令的权限。'
+  }
+  //查询所有用户信息
   if (qqnum===undefined) {
-    if (!isAdmin) {
-      return '错误：您没有使用该命令的权限。'
+    const caps = getCapabilities(meta)
+    if (!caps.listMembers) {
+      return `错误：${describeUnsupported('listMembers')}。请改为查询单个用户：\`yunhei.chk <QQ号>\`。`
     }
-    //检查机器人权限（仅群内全量检查时需要）
+    let rawMembers
     try {
-      let bot: OneBot.GroupMemberInfo = await meta.onebot.getGroupMemberInfo(meta.guildId, meta.selfId)
-      if (bot.role == 'member') {
-        return '错误：本功能需要机器人为群组管理员，请联系群主设置。'
-      }
-    } catch (error) {
-      return `错误：检查机器人权限失败，可能是机器人未加入该群或API出现问题。原因：${sanitizeErrorMessage(error, config)}`
-    }
-    let group_members
-    try {
-      group_members = await meta.onebot.getGroupMemberList(meta.guildId)
+      rawMembers = await listAllMembers(meta, meta.guildId)
     } catch (error) {
   return `错误：获取群成员列表失败。原因：${sanitizeErrorMessage(error, config)}`
     }
 
-  const membersToCheck = group_members
+  const membersToCheck: CheckMember[] = rawMembers.members.map(m => ({
+    user_id: m.user_id,
+    nickname: m.nickname,
+    isPrivileged: m.isManager,
+  }))
   const totalToCheck = membersToCheck.length
   // 开始时输出群员数量及将要检查的人数（包含管理员与群主）
   meta.send(`正在检查群内所有人员（共${totalToCheck}人）……`)
@@ -51,7 +81,7 @@ export default async function check(ctx: Context, meta: Session, qqnum: string, 
     const thresholds = [0.25, 0.5, 0.75]
     let nextThresholdIndex = 0
 
-    await processInBatches(membersToCheck, async (member: OneBot.GroupMemberInfo) => {
+    await processInBatches(membersToCheck, async (member: CheckMember) => {
       try {
         const res = await ctx.http.get(
           `https://yunhei.youshou.wiki/get_platform_users?api_key=${config.api_key}&mode=1&search_type=1&account_type=1&account=${member.user_id}`
@@ -75,14 +105,20 @@ export default async function check(ctx: Context, meta: Session, qqnum: string, 
             severe += 1
             // 构建严重用户信息并尝试踢群
             severe_users.push(`${member.nickname}（${member.user_id}）\n违规原因：${item.describe}\n登记人：${item.registration}\n上黑时间：${item.add_time}`)
-            if (member.role && member.role !== 'member') {
+            if (member.isPrivileged) {
               // 群主或管理员，机器人通常无权操作
               severe_users.push(`  - 该成员为群主/管理员，机器人无权进行踢出操作，请手动处理。`)
             } else {
-              try {
-                await meta.onebot.setGroupKick(meta.guildId, Number(member.user_id), true)
-              } catch (error) {
-                severe_users.push(`  - 踢出用户 ${member.nickname}（${member.user_id}）失败: ${sanitizeErrorMessage(error, config)}`);
+              const caps = getCapabilities(meta)
+              if (!caps.kick) {
+                // QQ 官方群等不支持踢人平台：仅记录到列表，不执行踢出
+                severe_users.push(`  - 当前平台不支持自动踢出，请手动处理。`)
+              } else {
+                try {
+                  await kickMember(meta, meta.guildId, String(member.user_id), true)
+                } catch (error) {
+                  severe_users.push(`  - 踢出用户 ${member.nickname}（${member.user_id}）失败: ${sanitizeErrorMessage(error, config)}`);
+                }
               }
             }
           }
@@ -132,7 +168,7 @@ export default async function check(ctx: Context, meta: Session, qqnum: string, 
         if (!data) return `查询成功，该用户不在黑名单中。`
         let nickname: string
         try {
-          nickname = (await meta.onebot.getStrangerInfo(Number(data.account_name))).nickname
+          nickname = (await getStrangerNickname(meta, String(data.account_name))) ?? String(data.account_name)
         } catch {
           nickname = String(data.account_name)
         }
