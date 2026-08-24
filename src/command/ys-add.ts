@@ -1,9 +1,18 @@
 import sanitizeErrorMessage from '../utils/sanitize-error-message';
 import time2Seconds from '../utils/time2-seconds';
 import dayRecord from '../utils/day-record';
+import {
+  getPlatform,
+  getCapabilities,
+  describeUnsupported,
+  isSelfManager,
+  isCallerManager,
+  kickMember,
+  muteMember,
+  getStrangerNickname,
+} from '../utils/platform';
 
 import type { Context, Session } from 'koishi';
-import type { OneBot } from 'koishi-plugin-adapter-onebot';
 import type Config from '../config';
 
 
@@ -30,8 +39,8 @@ export default async function add(ctx: Context, meta: Session, qqnum: string, le
   }
   //检查机器人权限
   try {
-    let bot: OneBot.GroupMemberInfo = await meta.onebot.getGroupMemberInfo(meta.guildId, meta.selfId)
-    if (bot.role == 'member') {
+    const check = await isSelfManager(meta)
+    if (!check.ok) {
       return '错误：本功能需要机器人为群组管理员，请联系群主设置。'
     }
   } catch (error) {
@@ -39,7 +48,9 @@ export default async function add(ctx: Context, meta: Session, qqnum: string, le
   }
 
   //检查使用者是否为管理
-  if (!config.admin_qqs || !(meta.userId in config.admin_qqs)) {
+  // OneBot: 走 admin_qqs 白名单；QQ 官方群: 检测消息发送者的 member_role（admin/owner）
+  const callerCheck = isCallerManager(meta, config)
+  if (!callerCheck.ok) {
     return '错误：您没有使用该命令的权限。'
   }
   //检查等级参数
@@ -58,33 +69,61 @@ export default async function add(ctx: Context, meta: Session, qqnum: string, le
     }
 
   // 仅管理员可调用此命令，这里使用配置中映射的“登记人昵称”
-  const registration = config.admin_qqs[meta.userId]
+  // QQ 官方群下若调用者未在 admin_qqs 中配置（按 member_role 放行），回退为发送者昵称或“群管理员”
+  const registration = config.admin_qqs?.[meta.userId]
+    ?? (meta as any).event?.user?.name
+    ?? (meta as any).username
+    ?? '群管理员'
     let post=await ctx.http.post(`https://yunhei.youshou.wiki/add_platform_users?api_key=${config.api_key}&account_type=1&name=${qqnum}&level=${level}&registration=${encodeURIComponent(registration)}&expiration=${expiration}&desc=${encodeURIComponent(dayRecord(desc))}`)
     if (post.code !== 1) {
       return `错误：添加用户失败。API返回：${post.msg || '未知错误'}`
     }
 
     //显示记录违规时长并执行相关操作
+    // 注意：踢人/禁言失败不再中断整体流程——云黑记录已成功，必须返回"已记录违规信息"
+    // 把失败原因收集到 followUps 数组，在最终消息里附带说明
+    const followUps: string[] = []
+    const platformQQ = getPlatform(meta) === 'qq'
     let measure:string=`记录违规信息`
     if (level==1) {  //1级（轻微）仅记录时长一年
       measure += `，时长一年`
     } else if (level==2) {  //2级（中等）记录时长永久并禁言
       measure = '永久' + measure
     } else if (level==3) {  //3级（严重）记录时长永久并踢群
-      try {
-        await meta.onebot.setGroupKick(meta.guildId, Number(qqnum), true)
-        measure = '踢出群并拒绝再次申请，永久' + measure
-      } catch (error) {
-  return `踢出用户失败，可能是权限不足或对方是群主/管理员。错误信息：${sanitizeErrorMessage(error, config)}`
+      const caps = getCapabilities(meta)
+      if (!caps.kick) {
+        // QQ 官方群等不支持踢人平台：仅记录到云黑，不执行踢群
+        measure = '永久' + measure + '（当前平台不支持自动踢出群，仅记录云黑）'
+      } else {
+        try {
+          await kickMember(meta, meta.guildId, String(qqnum), true)
+          measure = '踢出群并拒绝再次申请，永久' + measure
+        } catch (error) {
+          // 踢人失败：不中断流程，仅记入提示
+          followUps.push(`踢出用户失败：${sanitizeErrorMessage(error, config)}`)
+        }
       }
     }
     //禁言处理
     if (!(bantime == undefined)){
-      try {
-        await meta.onebot.setGroupBan(meta.guildId, Number(qqnum), time2Seconds(bantime))
-        measure += `并禁言${bantime}`
-      } catch (error) {
-  return `禁言用户失败，可能是权限不足或对方是群主/管理员。错误信息：${sanitizeErrorMessage(error, config)}`
+      const caps = getCapabilities(meta)
+      if (!caps.mute) {
+        // QQ 官方群等不支持禁言平台：仅记录到云黑，不执行禁言
+        measure += `（当前平台不支持禁言，仅记录云黑）`
+        if (platformQQ) {
+          followUps.push(`提示：QQ 官方机器人无法按 QQ 号禁言。可改用 \`yunhei ban @用户 ${bantime}\` 快速禁言群内成员。`)
+        }
+      } else {
+        try {
+          await muteMember(meta, meta.guildId, String(qqnum), time2Seconds(bantime))
+          measure += `并禁言${bantime}`
+        } catch (error) {
+          // 禁言失败：不中断流程，仅记入提示
+          followUps.push(`禁言用户失败：${sanitizeErrorMessage(error, config)}`)
+          if (platformQQ) {
+            followUps.push(`提示：QQ 官方机器人无法按 QQ 号禁言。可改用 \`yunhei ban @用户 ${bantime}\` 快速禁言群内成员。`)
+          }
+        }
       }
     }
     //显示处理结果部分
@@ -98,11 +137,16 @@ export default async function add(ctx: Context, meta: Session, qqnum: string, le
     }
     let nickname: string
     try {
-      nickname = (await meta.onebot.getStrangerInfo(Number(data.account_name || qqnum))).nickname
+      nickname = (await getStrangerNickname(meta, String(data.account_name || qqnum))) ?? String(data.account_name || qqnum)
     } catch {
       nickname = String(data.account_name || qqnum)
     }
-    return `已将${nickname}（${qqnum}）${measure}。\n违规原因：${data.describe}\n严重程度：${data.level}\n措施：${measure}\n登记人：${data.registration}\n上黑时间：${data.add_time}`
+    let result = `已将${nickname}（${qqnum}）${measure}。\n违规原因：${data.describe}\n严重程度：${data.level}\n措施：${measure}\n登记人：${data.registration}\n上黑时间：${data.add_time}`
+    // 追加失败提示（不阻断"已记录违规信息"主消息）
+    if (followUps.length > 0) {
+      result += `\n\n${followUps.join('\n')}`
+    }
+    return result
 
   } catch (error) {
     return `错误：执行添加操作时遇到意外。原因：${sanitizeErrorMessage(error, config)}`
