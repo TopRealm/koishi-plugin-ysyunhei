@@ -10,7 +10,7 @@ let cache: { version: string; contributors: string[] } | null = null
 export default async function readPackageMeta(): Promise<{ version: string; contributors: string[] }> {
   try {
     if (cache) return cache
-    const pkgPath = path.join(__dirname, '../package.json')
+    const pkgPath = path.join(__dirname, '../../package.json')
     const raw = await fs.readFile(pkgPath, 'utf-8')
     const pkg = JSON.parse(raw)
     const version: string = String(pkg.version || '未知')

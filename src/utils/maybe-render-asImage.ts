@@ -2,7 +2,6 @@ import { h } from 'koishi';
 
 import xh from './h/h';
 import puppeteerUtile from './puppeteer/puppeteer';
-import { getLogger } from './logger'
 
 import type { Context } from 'koishi';
 import type Config from '../config';
@@ -21,10 +20,9 @@ export default async function maybeRenderAsImage(
   options?: { title?: string }
 ): Promise<any> {
   try {
-    const logger = getLogger(ctx, config)
-  if (!config.render_as_image) { logger.info('[render] disabled by config'); return text }
+    if (!config.render_as_image) return text
   // 未配置浏览器路径时跳过渲染，回退为文本
-  if (!config.browser_path) { logger.warn('[render] skip: missing browser_path'); return text }
+  if (!config.browser_path) return text
     const title = options?.title ?? '云黑结果'
     // 拆分为行，构造简单卡片（使用 h()，避免 .ts 中使用 JSX）
     const lines = String(text ?? '').split('\n')
@@ -40,12 +38,8 @@ export default async function maybeRenderAsImage(
       }
     }
 
-  // 主题颜色与时间段：使用新配置
-  const lightColor = config.theme_light_color ?? '#e8edf2'
-  const darkColor = config.theme_dark_color ?? '#252525'
-  const startHour = (config.theme_start_hour ?? 8) | 0
-  const endHour = (config.theme_end_hour ?? 20) | 0
-  const colorTx = colorByHour(startHour, endHour, lightColor, darkColor)
+    const [startc, endc] = config.theme_color.split('/')
+    const colorTx = colorT(config.theme_date, startc, endc)
     // koishi 的 h() 函数不支持传入css
     const vnode = xh(
       'div',
@@ -71,25 +65,23 @@ export default async function maybeRenderAsImage(
       ),
       xh('div', { style: { marginTop: '16px', color: '#7b8794', fontSize: '22px' } }, '由 koishi-plugin-ysyunhei 生成')
     )
-  const buf = await puppeteerUtile(ctx, config, vnode)
+    const buf = await puppeteerUtile(config, vnode)
     if (!buf) return text
     return h('div',
       h.image('base64://' + buf.toString('base64')),
       url
     )
   } catch (e) {
-  try { (ctx as any).logger('ysyunhei').error('[render] failed:', e) } catch {}
+    console.log('error', e)
     return text
   }
 }
 
-function colorByHour(start: number, end: number, lightColor = '#e8edf2', darkColor = '#252525') : (bg: boolean) => string {
-  // 使用北京时间（UTC+8），与精致睡眠逻辑保持一致
-  const bj = new Date(Date.now() + 8 * 60 * 60 * 1000)
-  const h = bj.getUTCHours()
-  // 支持跨零点时间段
-  const isLight = start === end
-    ? true
-    : (start < end ? (h >= start && h < end) : (h >= start || h < end))
-  return (bg: boolean = true) => bg ? (isLight ? lightColor : darkColor) : (isLight ? darkColor : lightColor)
+function colorT(date: string = '8/20', lightColor = '#e8edf2', darkColor = '#252525') : (f: boolean) => string {
+  const [start, end] = date.split('/').map(Number);
+  const currentHour = new Date().getHours();
+  const dateBoolean = currentHour >= start && currentHour < end;
+  return (f: boolean = true) => {
+    return f ? dateBoolean ? lightColor : darkColor : dateBoolean ? darkColor : lightColor;
+  }
 }
